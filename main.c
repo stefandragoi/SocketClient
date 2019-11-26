@@ -11,7 +11,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -20,7 +19,9 @@
 #define MAX_FILENAME_LENGTH		16
 #define TIMEOUT_SEC				1
 #define TIMEOUT_USEC			0
+#define BAD_FILE_MSG			"Bad file name"
 #define FILE_NOT_FOUND_MSG		"File not found"
+#define SERVER_ERROR_MSG		"Server reading error"
 
 int wildcard_check(char string[]) {
 	int i, len;
@@ -32,6 +33,7 @@ int wildcard_check(char string[]) {
 		case '*':
 		case '[':
 		case ']':
+		case '^':
 			return 0;
 		default:
 			continue;
@@ -41,12 +43,75 @@ int wildcard_check(char string[]) {
 	return 1;
 }
 
+short get_port(char string[]) {
+	short port;
+	int i, len, status;
+
+	len = strlen(string);
+	for (i = 0; i < len; i++) {
+		if (string[i] < '0' || string[i] > '9') {
+			printf("Wrong port format\n");
+			return -1;
+		}
+	}
+	status = sscanf(string, "%hd", &port);
+	if (status == EOF) {
+		printf("sscanf port error\n");
+		return -1;
+	}
+
+	return port;
+}
+
+void process_data(int sock, char filename[]) {
+	int fd;
+	int n_bytes;
+	char buffer[BUFFER_SIZE];
+
+	/* Check for any error message, otherwise create the file */
+	n_bytes = recv(sock, buffer, BUFFER_SIZE, 0);
+	if (n_bytes <= 0) {
+		printf("Received nothing from server after %d sec %d u_sec\n", TIMEOUT_SEC, TIMEOUT_USEC);
+		return;
+	} else if (n_bytes == (strlen(FILE_NOT_FOUND_MSG) + 1)) {
+		if (strncmp(buffer, FILE_NOT_FOUND_MSG, strlen(FILE_NOT_FOUND_MSG)) == 0) {
+			printf("File not found...\n");
+			return;
+		}
+	} else if (n_bytes == (strlen(BAD_FILE_MSG) + 1)) {
+		if (strncmp(buffer, BAD_FILE_MSG, strlen(BAD_FILE_MSG)) == 0) {
+			printf("Name contains forbidden characters.\n");
+			return;
+		}
+	} else if (n_bytes == (strlen(SERVER_ERROR_MSG) + 1)) {
+		if (strncmp(buffer, FILE_NOT_FOUND_MSG, strlen(SERVER_ERROR_MSG)) == 0) {
+			printf("Server unable to read file.\n");
+			return;
+		}
+	} else {
+		fd = creat(filename, 0600);
+		if (fd < 0) {
+			printf("Unable to create file\n");
+			return;
+		}
+	}
+
+	/* Write in file until server stops sending data */
+	while (1) {
+		if (n_bytes > 0) {
+			write(fd, buffer, n_bytes);
+		} else {
+			return;
+		}
+		n_bytes = recv(sock, buffer, BUFFER_SIZE, 0);
+	}
+}
+
 int main (int argc, char **argv)
 {
 	char buffer[BUFFER_SIZE], filename[MAX_FILENAME_LENGTH + 1], server_ip[MAX_IP_LENGTH];
-	int i, running;
 	int n_bytes, status;
-	int fd, sock;
+	int sock;
 	short port;
 	unsigned int addr_len;
 
@@ -66,16 +131,8 @@ int main (int argc, char **argv)
 		memset(server_ip, 0, sizeof(server_ip));
 		memcpy(server_ip, argv[1], strlen(argv[1]));
 
-		/* check port format */
-		for (i = 0; i < strlen(argv[2]); i++) {
-			if (argv[2][i] < '0' || argv[2][i] > '9') {
-				printf("Wrong port format\n");
-				return 0;
-			}
-		}
-		status = sscanf(argv[2], "%hd", &port);
-		if (status == EOF) {
-			printf("sscanf port error\n");
+		port = get_port(argv[2]);
+		if (port < 0) {
 			return 0;
 		}
 
@@ -91,28 +148,26 @@ int main (int argc, char **argv)
 			return 0;
 		}
 
+		/* Create client socket */
 		sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (sock < 0) {
 			printf("Unable to create socket\n");
 			return 0;
 		}
-
 		/* Set receiving timeout */
 		timeout.tv_sec = TIMEOUT_SEC;
 		timeout.tv_usec = TIMEOUT_USEC;
 		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
+		/* Connect to server */
 		server_addr.sin_family = AF_INET;
 		server_addr.sin_port = htons(port);
-		/* Convert string address to binary format */
-		status = inet_pton(AF_INET, server_ip, &struct_addr);
+		status = inet_pton(AF_INET, server_ip, &struct_addr); /* Convert string address to binary format */
 		if (status <= 0) {
 			printf("Wrong IP address\n");
 			return 0;
 		}
-		/* Set server address */
-		server_addr.sin_addr = struct_addr;
-
+		server_addr.sin_addr = struct_addr; /* Set server address */
 		addr_len = sizeof(server_addr);
 		status = connect(sock, (struct sockaddr*)&server_addr, addr_len);
 		if (status < 0) {
@@ -120,7 +175,7 @@ int main (int argc, char **argv)
 			return 0;
 		}
 
-		/* Send to server the name of the desired file */
+		/* Send the name of the desired file */
 		memset(buffer, 0, sizeof(buffer));
 		strncpy(buffer, filename, strlen(filename) + 1);
 		n_bytes = send(sock, buffer, strlen(buffer) + 1, 0);
@@ -129,33 +184,8 @@ int main (int argc, char **argv)
 			return 0;
 		}
 
-		/* Check what server sent */
-		running = 1;
-		memset(buffer, 0, sizeof(buffer));
-		n_bytes = recv(sock, buffer, BUFFER_SIZE, 0);
-		if (n_bytes <= 0) {
-			printf("Received nothing from server after %d sec %d u_sec\n", TIMEOUT_SEC, TIMEOUT_USEC);
-			running = 0;
-		} else if (n_bytes == (strlen(FILE_NOT_FOUND_MSG) + 1)) {
-			if (strncmp(buffer, FILE_NOT_FOUND_MSG, strlen(FILE_NOT_FOUND_MSG)) == 0) {
-				printf("File not found...\n");
-				running = 0;
-			}
-		} else {
-			fd = creat(filename, 0600);
-			if (fd < 0) {
-				printf("Unable to create file\n");
-				running = 0;
-			}
-		}
-		while (running) {
-			if (n_bytes > 0) {
-				write(fd, buffer, n_bytes);
-			} else {
-				running = 0;
-			}
-			n_bytes = recv(sock, buffer, BUFFER_SIZE, 0);
-		}
+		/* Process what server sent */
+		process_data(sock, filename);
 
 		status = close(sock);
 		if (status < 0) {
